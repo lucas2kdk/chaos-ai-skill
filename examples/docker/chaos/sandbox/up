@@ -6,7 +6,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 "$DOCKER" build -q -t "$IMAGE" "$APP" >/dev/null
 id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-labels=(--label chaos.sandbox=$PROJECT --label "chaos.instance=$id")
+labels=(--label "chaos.sandbox=$PROJECT" --label "chaos.instance=$id")
 
 "$(dirname "${BASH_SOURCE[0]}")/down" >/dev/null 2>&1 || true
 "$DOCKER" network create "${labels[@]}" "$NET" >/dev/null
