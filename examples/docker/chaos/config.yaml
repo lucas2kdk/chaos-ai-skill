@@ -1,0 +1,10 @@
+# Settings for the chaos plugin in this repo. Flat `key: value` pairs only.
+
+# Where findings go: local (chaos/findings/*.md) or github (issues in the current gh repo).
+sink: local
+
+# Upper bound for any hypothesis's fault duration. Longer hypotheses fail validation.
+max_duration: 300s
+
+# Leave a sandbox running after a run (true) or tear it down (false).
+keep_sandbox: false

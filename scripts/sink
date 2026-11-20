@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run a report-sink command on the sink configured in chaos/config.yaml (`sink:`, default local).
+# usage: sink list-open [hypothesis-id]                       -> "<hypothesis-id> <ref>" per open finding
+#        sink create <hypothesis-id> <finding.md>             -> prints the new finding's ref
+#        sink comment <ref> <body.md>                         -> adds new evidence to an open finding
+#        sink close <ref>                                     -> marks a finding fixed
+# A finding's frontmatter (title, severity, run) decides its title and severity label; the frontmatter
+# is stripped and a generated "## Provenance" section from the run record is appended before publishing.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+find_chaos_dir
+name="$(config_get sink local)"
+[[ -x "$PLUGIN_ROOT/scripts/sink-$name" ]] || die "unknown sink '$name' in chaos/config.yaml (local or github)"
+exec "$PLUGIN_ROOT/scripts/sink-$name" "$@"

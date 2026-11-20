@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Write the outcome of a run to chaos/runs/<run-id>/record.json, keeping fields already there
+# (started_at and the phase log written by `phase`).
+# usage: record [--failed-phase <phase>] [--note <text>] <run-id> <hypothesis-id> <outcome> [finding-ref]
+#   a violated run needs the finding ref, except in mode auto (autorun), where it is marked needs_triage
+#   outcome: held | violated | not-reproducible | aborted
+# Prints the path of record.json. Exit 2 on bad arguments.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+failed="" note=""
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --failed-phase) failed="${2:?}"; shift 2 ;;
+    --note) note="${2:?}"; shift 2 ;;
+    *) die "unknown option $1" 2 ;;
+  esac
+done
+[[ $# -ge 3 ]] || die "usage: record [--failed-phase <phase>] [--note <text>] <run-id> <hypothesis-id> <outcome> [finding-ref]" 2
+run=$1 hyp=$2 outcome=$3 ref="${4:-}"
+case "$outcome" in held|violated|not-reproducible|aborted) ;; *) die "bad outcome '$outcome' (held|violated|not-reproducible|aborted)" 2 ;; esac
+find_chaos_dir
+dir="$CHAOS_DIR/runs/$run"
+f="$dir/record.json"
+mode="$( [[ -f "$f" ]] && jq -r '.mode // "run"' "$f" || echo run)"
+# Unattended runs (mode auto) never file findings: a violation is recorded as needing triage instead.
+[[ "$outcome" != violated || -n "$ref" || "$mode" == auto ]] || die "a violated run needs the finding reference" 2
+mkdir -p "$dir"
+[[ -f "$f" ]] || echo '{}' > "$f"
+jq --arg run "$run" --arg hyp "$hyp" --arg outcome "$outcome" --arg ref "$ref" \
+   --arg failed "$failed" --arg note "$note" --arg at "$(now)" '
+  .run = $run | .hypothesis = $hyp | .outcome = $outcome
+  | .finding = (if $ref == "" then null else $ref end)
+  | .failed_phase = (if $failed == "" then null else $failed end)
+  | .note = (if $note == "" then .note else $note end)
+  | .ended_at = $at
+  | .needs_triage = (.mode == "auto" and $outcome == "violated")
+  | .started_at //= $at
+  | .phases //= []' "$f" > "$f.tmp"
+mv "$f.tmp" "$f"
+echo "$f"

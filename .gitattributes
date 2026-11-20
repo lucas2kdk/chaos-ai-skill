@@ -1,0 +1,2 @@
+# Everything here is run by bash or bats, also from a Windows clone. Keep LF.
+* text=auto eol=lf

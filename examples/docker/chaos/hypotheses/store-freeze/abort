@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Abort check: stop the experiment if the api starts crash-looping while the store is frozen.
+# Exit 0 = keep going, non-zero = stop now. Read-only.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../../sandbox/lib.sh"
+restarts="$("$DOCKER" inspect -f '{{.RestartCount}}' "$API" 2>/dev/null)" || { echo "api container is gone"; exit 1; }
+if (( restarts > 2 )); then echo "api restarted $restarts times during the fault"; exit 1; fi

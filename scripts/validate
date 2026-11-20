@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Check that this repo's chaos binding and hypotheses follow the contracts in docs/contracts.md.
+# usage: validate [--draft] [binding | hypothesis <id> | all]          (default: all)
+#        validate --stamp binding | --stamp hypothesis <id>
+#   --draft  do not require review stamps (used while drafting a binding or hypothesis)
+#   --stamp  after a clean check, record what you reviewed in chaos/.review
+# Exit 0 if everything checked is valid, 1 otherwise. Problems go to stdout as "FAIL <what>: <why>",
+# warnings as "warn <what>: <why>".
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+draft=0 stamp=0
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --draft) draft=1 ;;
+    --stamp) stamp=1; draft=1 ;;
+    *) die "unknown option $1" 2 ;;
+  esac
+  shift
+done
+what="${1:-all}"
+[[ $stamp -eq 0 || "$what" == binding || "$what" == hypothesis ]] \
+  || die "--stamp needs what you reviewed: --stamp binding or --stamp hypothesis <id>" 2
+find_chaos_dir
+fail=0 fails=0
+bad() { echo "FAIL $1: $2"; fail=1; fails=$((fails + 1)); }
+warn() { echo "warn $1: $2"; }
+
+check_binding() {
+  local t="$CHAOS_DIR/target.md" before=$fails
+  if [[ ! -f "$t" ]]; then bad binding "chaos/target.md is missing"; return; fi
+  local kind key v f
+  kind="$(fm_get "$t" kind)"
+  [[ "$kind" == sandbox || "$kind" == existing ]] || bad binding "target.md kind must be sandbox or existing, got '$kind'"
+  for key in name may_affect must_not_affect; do
+    v="$(fm_get "$t" "$key")"
+    [[ -n "$v" && "$v" != "<"* ]] || bad binding "target.md $key is empty or still a placeholder"
+  done
+  local needed=(guard evidence)
+  [[ "$kind" == sandbox ]] && needed+=(up down)
+  for f in "${needed[@]}"; do
+    [[ -x "$CHAOS_DIR/sandbox/$f" ]] || bad binding "chaos/sandbox/$f is missing or not executable"
+  done
+  local review=draft
+  if [[ $draft -eq 0 && $fails -eq $before ]]; then
+    local reviewed
+    reviewed="$(review_get binding)"
+    if [[ -z "$reviewed" && -n "$(fm_get "$t" reviewed_hash)" ]]; then
+      bad binding "review stamps moved from target.md to chaos/.review; review the binding again, then run validate --stamp binding (and remove the reviewed_hash line)"
+    elif [[ -z "$reviewed" ]]; then
+      bad binding "not reviewed yet; review it, then run validate --stamp binding"
+    elif [[ "$reviewed" != "$(binding_hash)" ]]; then
+      bad binding "target.md or chaos/sandbox/ changed since review; review again, then run validate --stamp binding"
+    fi
+    review=reviewed
+  fi
+  [[ $fails -eq $before ]] && echo "ok binding (kind=$kind; name, may_affect, must_not_affect set; ${needed[*]} executable; $review)"
+  return 0
+}
+
+# dur_field <md> <key> <default> -> seconds, or fails the hypothesis
+dur_field() {
+  local v
+  v="$(fm_get "$1" "$2")"
+  to_seconds "${v:-$3}"
+}
+
+check_hypothesis() {
+  local id=$1 dir="$CHAOS_DIR/hypotheses/$1" before=$fails
+  [[ "$id" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || bad "hypothesis $id" "id must be kebab-case"
+  if [[ ! -d "$dir" ]]; then bad "hypothesis $id" "chaos/hypotheses/$id does not exist"; return; fi
+  local md="$dir/hypothesis.md" f summary=""
+  if [[ ! -f "$md" ]]; then
+    bad "hypothesis $id" "hypothesis.md is missing"
+  else
+    [[ "$(fm_get "$md" id)" == "$id" ]] || bad "hypothesis $id" "frontmatter id must equal the directory name"
+    [[ -n "$(fm_get "$md" steady_state)" ]] || bad "hypothesis $id" "frontmatter steady_state is missing"
+    local dur secs max wait ct rw oneoff
+    dur="$(fm_get "$md" duration)"
+    max="$(to_seconds "$(config_get max_duration 300s)")" || die "config.yaml max_duration is not like 300s"
+    if [[ -z "$dur" ]]; then
+      bad "hypothesis $id" "frontmatter duration is missing; every fault must be time-boxed"
+    elif ! secs="$(to_seconds "$dur")"; then
+      bad "hypothesis $id" "duration '$dur' is not like 90s, 5m or 1h"
+    elif ! (( secs > 0 && secs <= max )); then
+      bad "hypothesis $id" "duration ${secs}s must be between 1s and max_duration ${max}s"
+    elif ! wait="$(dur_field "$md" wait 5s)"; then
+      bad "hypothesis $id" "wait is not like 5s"
+    elif ! ct="$(dur_field "$md" check_timeout 60s)" || (( ct == 0 )); then
+      bad "hypothesis $id" "check_timeout is not like 60s"
+    elif ! rw="$(dur_field "$md" recovers_within "$((wait + ct))s")"; then
+      bad "hypothesis $id" "recovers_within is not like 30s"
+    elif (( wait + ct + 10 > secs )); then
+      bad "hypothesis $id" "observation does not fit inside the fault: wait ${wait}s + check_timeout ${ct}s + 10s margin > duration ${secs}s"
+    else
+      summary="duration ${secs}s, wait ${wait}s, check_timeout ${ct}s, recovers_within ${rw}s"
+    fi
+    oneoff="$(fm_get "$md" one_off)"
+    [[ -z "$oneoff" || "$oneoff" == true || "$oneoff" == false ]] || bad "hypothesis $id" "one_off must be true or false"
+    [[ "$oneoff" == true ]] && summary="$summary, one-off"
+    local ai ctl tol
+    ai="$(fm_get "$md" abort_interval)"
+    if [[ -n "$ai" ]] && ! { to_seconds "$ai" >/dev/null && (( $(to_seconds "$ai") > 0 )); }; then
+      bad "hypothesis $id" "abort_interval must be like 5s and more than 0"
+    fi
+    ctl="$(fm_get "$md" control)" tol="$(fm_get "$md" tolerance)"
+    [[ -z "$ctl" || "$ctl" == true || "$ctl" == false ]] || bad "hypothesis $id" "control must be true or false"
+    if [[ "$ctl" == true ]]; then
+      if [[ -z "$tol" ]]; then
+        bad "hypothesis $id" "control: true needs a tolerance, like 10%"
+      elif [[ ! "$tol" =~ ^[0-9]+(\.[0-9]+)?%$ ]]; then
+        bad "hypothesis $id" "tolerance must be a percentage like 10%, got '$tol'"
+      else
+        summary="$summary, control group within $tol"
+      fi
+    fi
+  fi
+  for f in fault check; do
+    [[ -x "$dir/$f" ]] || bad "hypothesis $id" "$f is missing or not executable"
+  done
+  if [[ -e "$dir/abort" ]]; then
+    if [[ -x "$dir/abort" ]]; then summary="$summary, abort check"; else bad "hypothesis $id" "abort exists but is not executable"; fi
+  fi
+  local review=draft
+  if [[ $draft -eq 0 && $fails -eq $before ]]; then
+    local reviewed
+    reviewed="$(review_get "hypothesis/$id")"
+    if [[ -z "$reviewed" ]]; then
+      bad "hypothesis $id" "not reviewed yet; review it, then run validate --stamp hypothesis $id"
+    elif [[ "$reviewed" != "$(hypothesis_hash "$id")" ]]; then
+      bad "hypothesis $id" "hypothesis.md, fault or check changed since review; review again, then run validate --stamp hypothesis $id"
+    fi
+    review=reviewed
+  fi
+  # chaos/lib/ is not hashed; say so when a stamped fault or check uses a helper edited after the stamp.
+  if [[ -f "$CHAOS_DIR/.review" && -d "$CHAOS_DIR/lib" ]] && grep -qs 'lib/' "$dir/fault" "$dir/check"; then
+    local h
+    for h in "$CHAOS_DIR"/lib/*; do
+      [[ -f "$h" && "$h" -nt "$CHAOS_DIR/.review" ]] && grep -qs "lib/$(basename "$h")" "$dir/fault" "$dir/check" \
+        && warn "hypothesis $id" "uses chaos/lib/$(basename "$h"), which changed after the last review stamp"
+    done
+  fi
+  [[ $fails -eq $before ]] && echo "ok hypothesis $id ($summary; fault, check executable; $review)"
+  return 0
+}
+
+case "$what" in
+  binding) check_binding ;;
+  hypothesis) check_hypothesis "${2:?usage: validate hypothesis <id>}" ;;
+  all)
+    check_binding
+    if [[ -d "$CHAOS_DIR/hypotheses" ]]; then
+      for d in "$CHAOS_DIR"/hypotheses/*/; do
+        [[ -d "$d" ]] && check_hypothesis "$(basename "$d")"
+      done
+    fi
+    ;;
+  *) die "usage: validate [--draft] [binding | hypothesis <id> | all], or validate --stamp binding | hypothesis <id>" 2 ;;
+esac
+
+if [[ $stamp -eq 1 ]]; then
+  [[ $fail -eq 0 ]] || die "not stamping: fix the problems above first"
+  if [[ "$what" == binding ]]; then
+    h="$(binding_hash)"; review_set binding "$h"
+  else
+    h="$(hypothesis_hash "$2")"; review_set "hypothesis/$2" "$h"
+  fi
+  echo "stamped $what${2:+ $2} as reviewed ($h) in chaos/.review"
+fi
+exit $fail

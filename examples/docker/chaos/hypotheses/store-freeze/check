@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Five requests to /items; each must answer 200 or 503 within 2s.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../../sandbox/lib.sh"
+bad=0
+for i in 1 2 3 4 5; do
+  read -r code secs < <(get /items 3)
+  if [[ "$code" =~ ^(200|503)$ ]] && awk -v s="$secs" 'BEGIN { exit !(s <= 2) }'; then
+    echo "ok sample $i/5: GET /items -> $code in ${secs}s"
+  else
+    echo "VIOLATED sample $i/5: GET /items -> ${code:-000} in ${secs:-?}s (want 200 or 503 within 2s)"
+    bad=1
+  fi
+  sleep 1
+done
+exit $bad

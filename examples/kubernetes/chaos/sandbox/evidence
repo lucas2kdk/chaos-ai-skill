@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# usage: evidence <out-dir> <since>. Logs, events, pod status and chaos objects, read with the observer
+# credentials only.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+out="${1:?usage: evidence <out-dir> <since>}" since="${2:?usage: evidence <out-dir> <since>}"
+mkdir -p "$out"
+k() { kubectl --kubeconfig "$OBS" -n "$TARGET_NS" "$@"; }
+for d in frontend cartservice productcatalogservice redis-cart; do
+  k logs "deploy/$d" --all-containers --timestamps --since-time="$since" > "$out/$d.log" 2>&1
+done
+k get events --sort-by=.lastTimestamp > "$out/events.txt" 2>&1
+k get pods -o wide > "$out/pods.txt" 2>&1
+k get podchaos,networkchaos,stresschaos -o yaml > "$out/chaos-objects.yaml" 2>&1

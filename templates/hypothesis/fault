@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# usage: fault apply|revert|status
+#   apply   start the fault (only ever called through the plugin's `phase fault apply`)
+#   revert  end it; must be safe to call any number of times
+#   status  print "active" or "inactive" on the first line
+set -uo pipefail
+case "${1:-}" in
+  apply)  echo "TODO: start the fault" >&2; exit 1 ;;
+  revert) : ;;
+  status) echo inactive ;;
+  *) echo "usage: fault apply|revert|status" >&2; exit 2 ;;
+esac

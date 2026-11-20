@@ -1,0 +1,12 @@
+{
+  "name": "chaos",
+  "version": "0.2.0",
+  "description": "Chaos experiments for any repo: describe the target, write steady-state hypotheses, inject time-boxed faults behind hook-enforced guardrails, and file findings a fixer can reproduce.",
+  "author": {
+    "name": "Lucas Christensen"
+  },
+  "homepage": "https://github.com/lucas2kdk/chaos-ai-skill",
+  "repository": "https://github.com/lucas2kdk/chaos-ai-skill",
+  "license": "MIT",
+  "keywords": ["chaos-engineering", "resilience", "testing", "fault-injection"]
+}

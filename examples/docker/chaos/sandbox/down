@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Remove the containers and network created by up. Only touches objects labelled as this sandbox.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+ids="$("$DOCKER" ps -aq --filter "label=chaos.sandbox=$PROJECT")"
+[[ -z "$ids" ]] || "$DOCKER" rm -f $ids >/dev/null
+nets="$("$DOCKER" network ls -q --filter "label=chaos.sandbox=$PROJECT")"
+[[ -z "$nets" ]] || "$DOCKER" network rm $nets >/dev/null
+rm -f "$INSTANCE_FILE"
+echo "sandbox down"

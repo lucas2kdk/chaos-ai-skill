@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Local report sink: findings are markdown files in chaos/findings/. No network access.
+#   chaos/findings/<hypothesis-id>.md           frontmatter (status, severity, title, created) + body
+#   chaos/findings/<hypothesis-id>.comments.md  evidence added by later runs
+# Refs are paths relative to the repo root. Commands: see scripts/sink.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+find_chaos_dir
+dir="$CHAOS_DIR/findings"
+
+ref_of() { echo "chaos/findings/$1.md"; }
+file_of() {
+  [[ "$1" =~ ^chaos/findings/([a-z0-9-]+)\.md$ ]] || die "not a local finding ref: $1" 2
+  echo "$REPO_ROOT/$1"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  list-open)
+    for f in "$dir"/*.md; do
+      [[ -f "$f" && "$f" != *.comments.md ]] || continue
+      [[ "$(fm_get "$f" status)" == open ]] || continue
+      id="$(fm_get "$f" hypothesis)"
+      [[ -z "${1:-}" || "$id" == "$1" ]] && echo "$id $(ref_of "$id")"
+    done
+    exit 0
+    ;;
+  create)
+    [[ $# -eq 2 ]] || die "usage: sink create <hypothesis-id> <finding.md>" 2
+    id=$1 body=$2
+    "$PLUGIN_ROOT/scripts/lint-finding" "$body" >/dev/null || die "finding not published"
+    f="$dir/$id.md"
+    if [[ -f "$f" && "$(fm_get "$f" status)" == open ]]; then
+      die "an open finding exists for $id; use: sink comment $(ref_of "$id") <body.md>" 3
+    fi
+    mkdir -p "$dir"
+    pub="$(mktemp)"; publish_body "$body" "$pub"
+    { printf -- '---\nhypothesis: %s\nstatus: open\nseverity: %s\ntitle: "%s"\nrun: %s\ncreated: %s\n---\n\n' \
+        "$id" "$(fm_get "$body" severity)" "$(fm_get "$body" title | tr '"' "'")" "$(fm_get "$body" run)" "$(now)"
+      cat "$pub"; } > "$f"
+    rm -f "$pub"
+    rm -f "$dir/$id.comments.md"
+    ref_of "$id"
+    ;;
+  comment)
+    [[ $# -eq 2 ]] || die "usage: sink comment <ref> <body.md>" 2
+    f="$(file_of "$1")"
+    [[ -f "$f" ]] || die "no such finding: $1"
+    "$PLUGIN_ROOT/scripts/sanitize" --detect "$2" || die "comment not published"
+    pub="$(mktemp)"; publish_body "$2" "$pub"
+    { printf '# %s\n\n' "$(now)"; cat "$pub"; printf '\n'; } >> "${f%.md}.comments.md"
+    rm -f "$pub"
+    echo "$1"
+    ;;
+  close)
+    [[ $# -eq 1 ]] || die "usage: sink close <ref>" 2
+    f="$(file_of "$1")"
+    [[ -f "$f" ]] || die "no such finding: $1"
+    awk 'NR == 1 && $0 == "---" { fm = 1; print; next }
+         fm && $0 == "---" { fm = 0 }
+         fm && /^status:/ { $0 = "status: fixed" }
+         { print }' "$f" > "$f.tmp"
+    mv "$f.tmp" "$f"
+    echo "$1"
+    ;;
+  *) die "usage: sink list-open|create|comment|close ..." 2 ;;
+esac

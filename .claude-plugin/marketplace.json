@@ -1,0 +1,12 @@
+{
+  "name": "chaos-ai-skill",
+  "owner": { "name": "Lucas Christensen" },
+  "description": "Chaos experiments for any repo, as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "chaos",
+      "source": "./",
+      "description": "Describe a target, write steady-state hypotheses, inject time-boxed faults behind hook-enforced guardrails, and file findings a fixer can reproduce."
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# PreToolUse hook for Bash, Write and Edit. Enforces docs/guardrails.md:
+#   - outside a run: hypothesis fault executables may only be run through `phase`;
+#   - during a run (chaos/runs/.active exists): Bash may only run the plugin's scripts, with the
+#     subcommands the current phase allows, or a few read-only utilities; Write/Edit may only touch
+#     the run's own directory; `phase confirm` always asks the user.
+# Reads the hook JSON on stdin. Allows by printing nothing; denies or asks with hookSpecificOutput JSON.
+set -uo pipefail
+export LC_ALL=C
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SCRIPTS="$PLUGIN_ROOT/scripts"
+
+input="$(cat)"
+tool="$(jq -r '.tool_name // empty' <<<"$input")"
+cwd="$(jq -r '.cwd // empty' <<<"$input")"
+[[ -n "$cwd" ]] || cwd="$PWD"
+
+decide() {
+  jq -n --arg d "$1" --arg r "$2" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $d, permissionDecisionReason: $r}}'
+  exit 0
+}
+
+chaos_dir=""
+d="$cwd"
+while [[ "$d" != / && -n "$d" ]]; do
+  if [[ -f "$d/chaos/target.md" || -f "$d/chaos/config.yaml" ]]; then chaos_dir="$d/chaos"; break; fi
+  d="$(dirname "$d")"
+done
+[[ -n "$chaos_dir" ]] || exit 0
+chaos_dir="$(cd "$chaos_dir" && pwd -P)"
+active="$chaos_dir/runs/.active"
+
+if [[ ! -f "$active" ]]; then
+  if [[ "$tool" == Bash ]]; then
+    cmd="$(jq -r '.tool_input.command // empty' <<<"$input")"
+    if grep -qE '(^|[[:space:]/"'"'"'])hypotheses/[^[:space:]]+/fault([[:space:]"'"'"']|$)' <<<"$cmd"; then
+      decide deny "chaos guardrail [no run]: hypothesis faults only run through ${SCRIPTS}/phase, inside a run started with /chaos:run or /chaos:verify"
+    fi
+  fi
+  exit 0
+fi
+
+phase="$(jq -r '.phase' "$active")"
+run="$(jq -r '.run' "$active")"
+rundir="$chaos_dir/runs/$run"
+deny() { decide deny "chaos guardrail [phase $phase]: $1"; }
+
+case "$tool" in
+  Write|Edit)
+    path="$(jq -r '.tool_input.file_path // empty' <<<"$input")"
+    [[ "$path" == /* ]] || path="$cwd/$path"
+    real="$(realpath -m "$path")"
+    [[ "$real" == "$rundir"/* ]] || deny "during a run, files may only be written under chaos/runs/$run/ (tried $path)"
+    [[ "$real" != "$rundir/record.json" ]] || deny "record.json is written by the phase script only"
+    exit 0
+    ;;
+  Bash) ;;
+  *) exit 0 ;;
+esac
+
+cmd="$(jq -r '.tool_input.command // empty' <<<"$input")"
+
+# shell_syntax <cmd>: print the first character the shell would treat as syntax, or nothing.
+# ; & | < > are syntax outside quotes; $ and ` are syntax outside single quotes (the shell expands
+# them inside double quotes too); a backslash outside single quotes escapes the next character.
+shell_syntax() {
+  local s=$1 i c q=""
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    if [[ "$q" == "'" ]]; then
+      [[ "$c" == "'" ]] && q=""
+      continue
+    fi
+    if [[ "$c" == '\' ]]; then i=$((i + 1)); continue; fi
+    if [[ "$q" == '"' ]]; then
+      case "$c" in
+        '"') q="" ;;
+        '$'|'`') echo "$c"; return ;;
+      esac
+      continue
+    fi
+    case "$c" in
+      "'"|'"') q="$c" ;;
+      ';'|'&'|'|'|'<'|'>'|'$'|'`') echo "$c"; return ;;
+    esac
+  done
+}
+[[ "$cmd" != *$'\n'* ]] || deny "during a run, run one command at a time: no line breaks"
+bad_char="$(shell_syntax "$cmd")"
+if [[ -n "$bad_char" ]]; then
+  deny "during a run, run one command at a time with no pipes, redirects, chaining or \$ expansion outside quotes (found '$bad_char'). Inside quotes, | ; & < > are fine; use grep -e for several patterns"
+fi
+words=()
+while IFS= read -r w; do words+=("$w"); done < <(xargs -n1 printf '%s\n' <<<"$cmd" 2>/dev/null)
+[[ ${#words[@]} -gt 0 ]] || deny "could not parse the command"
+first="${words[0]}" sub="${words[1]:-}" arg="${words[2]:-}"
+
+case "$first" in
+  cat|head|tail|ls|grep|wc|jq|date|diff|sleep) exit 0 ;;
+esac
+
+[[ "$first" == /* ]] && real="$(realpath -m "$first")" || real=""
+name="$(basename "$first")"
+if [[ "$real" != "$SCRIPTS/$name" || ! -x "$real" ]]; then
+  deny "during a run, Bash may only run the chaos plugin's scripts by absolute path ($SCRIPTS/...) or cat, head, tail, ls, grep, wc, jq, date, diff, sleep"
+fi
+
+allow_in() {
+  local p
+  for p in "$@"; do [[ "$phase" == "$p" ]] && exit 0; done
+  deny "'$name $sub${arg:+ $arg}' is allowed only in phase(s): $*"
+}
+
+case "$name" in
+  sanitize|lint-finding) exit 0 ;;
+  validate) [[ "$cmd" != *--stamp* ]] && exit 0; deny "the binding cannot be re-stamped during a run" ;;
+  pick) allow_in plan ;;
+  record|watchdog) deny "$name is run by the phase script, not directly" ;;
+  sink)
+    case "$sub" in
+      list-open) allow_in plan triage report ;;
+      create|comment) allow_in report ;;
+      *) deny "sink $sub is not allowed during a run" ;;
+    esac
+    ;;
+  phase)
+    case "$sub" in
+      show|guard|to|end|abort|note) exit 0 ;;
+      start) deny "run $run is active; end it or abort it first" ;;
+      up) allow_in plan ;;
+      baseline) allow_in plan triage ;;
+      recover) allow_in observe triage ;;
+      reset) allow_in triage ;;
+      confirm)
+        [[ "$phase" == plan ]] || deny "confirm only in phase plan"
+        t="$chaos_dir/target.md"
+        get() { awk -v k="$1" 'NR>1 && $0=="---"{exit} index($0,k":")==1{sub(/^[^:]*:[ \t]*/,"");print;exit}' "$t"; }
+        decide ask "Chaos run $run will inject faults into an EXISTING target: '$(get name)'. May affect: $(get may_affect). Must not affect: $(get must_not_affect). Approve only if this is the instance you mean."
+        ;;
+      fault)
+        case "$arg" in
+          status|revert) exit 0 ;;
+          apply)
+            [[ "$(jq -r .guard_passed "$active")" == true ]] || deny "the guard has not passed in this run; run phase guard"
+            allow_in inject triage
+            ;;
+          *) deny "unknown fault action '$arg'" ;;
+        esac
+        ;;
+      check|evidence) allow_in observe triage ;;
+      *) deny "unknown phase command '$sub'" ;;
+    esac
+    ;;
+  *) deny "$name is not allowed during a run" ;;
+esac

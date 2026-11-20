@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Exit 0 only if both containers exist and carry this sandbox's label and the instance id written by up.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+want="$(instance)"
+[[ -n "$want" ]] || { echo "guard: no sandbox instance recorded; run sandbox/up" >&2; exit 1; }
+for c in "$API" "$STORE"; do
+  got="$("$DOCKER" inspect -f '{{index .Config.Labels "chaos.sandbox"}} {{index .Config.Labels "chaos.instance"}}' "$c" 2>/dev/null)"
+  if [[ "$got" != "$PROJECT $want" ]]; then
+    echo "guard: container $c is not instance $want of sandbox $PROJECT (got '$got')" >&2
+    exit 1
+  fi
+done
+echo "guard: sandbox $PROJECT instance $want"

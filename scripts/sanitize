@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Redact credential-shaped strings and email addresses. Every evidence excerpt goes through this before reporting.
+# usage: sanitize [file]            print the redacted text (stdin if no file)
+#        sanitize --detect [file]   print nothing to stdout; exit 1 and list the matching line numbers
+#                                   on stderr if anything would be redacted, else exit 0
+# Pattern-based: it catches common token shapes, not every possible secret.
+set -euo pipefail
+
+redact() {
+  sed -E \
+    -e 's/gh[pousr]_[A-Za-z0-9]{20,}/[REDACTED]/g' \
+    -e 's/github_pat_[A-Za-z0-9_]{20,}/[REDACTED]/g' \
+    -e 's/glpat-[A-Za-z0-9_-]{20,}/[REDACTED]/g' \
+    -e 's/(AKIA|ASIA)[A-Z0-9]{16}/[REDACTED]/g' \
+    -e 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/[REDACTED]/g' \
+    -e 's/xox[abprs]-[A-Za-z0-9-]{10,}/[REDACTED]/g' \
+    -e 's/sk-[A-Za-z0-9_-]{20,}/[REDACTED]/g' \
+    -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----.*/[REDACTED]/g' \
+    -e 's/([Bb]earer )[A-Za-z0-9._~+\/=-]{12,}/\1[REDACTED]/g' \
+    -e 's/(([Pp]ass(word)?|[Ss]ecret|[Tt]oken|[Aa]pi[_-]?[Kk]ey)["'"'"']?[[:space:]]*[=:][[:space:]]*)[^][:space:],;"'"'"'[]+/\1[REDACTED]/g' \
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[REDACTED-EMAIL]/g'
+}
+
+if [[ "${1:-}" == --detect ]]; then
+  shift
+  input="$(cat "${1:--}")"
+  lines="$( { diff <(printf '%s\n' "$input") <(printf '%s\n' "$input" | redact) || true; } \
+    | sed -nE 's/^([0-9]+)(,[0-9]+)?c.*/\1\2/p' | tr '\n' ' ')"
+  if [[ -n "$lines" ]]; then
+    echo "sanitize: credential- or email-shaped text on line(s) ${lines% }" >&2
+    exit 1
+  fi
+  exit 0
+fi
+redact < "${1:-/dev/stdin}"

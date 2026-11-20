@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# usage: fault apply|revert|status. Freezes the store container with docker pause.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../../sandbox/lib.sh"
+case "${1:-}" in
+  apply) "$DOCKER" pause "$STORE" >/dev/null ;;
+  revert)
+    if [[ "$("$DOCKER" inspect -f '{{.State.Paused}}' "$STORE" 2>/dev/null)" == true ]]; then
+      "$DOCKER" unpause "$STORE" >/dev/null
+    fi
+    ;;
+  status)
+    if [[ "$("$DOCKER" inspect -f '{{.State.Paused}}' "$STORE" 2>/dev/null)" == true ]]; then echo active; else echo inactive; fi
+    ;;
+  *) echo "usage: fault apply|revert|status" >&2; exit 2 ;;
+esac

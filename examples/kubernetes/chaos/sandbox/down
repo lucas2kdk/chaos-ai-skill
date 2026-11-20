@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Delete the kind cluster. Runs only when keep_sandbox is false in chaos/config.yaml.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+"$ROOT/cluster/down.sh"
+rm -f "$ROOT"/cluster/kubeconfigs/*.kubeconfig

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# usage: fault apply|revert|status. Applies fault.yaml (Chaos Mesh) with the injector credentials.
+set -uo pipefail
+here="$(dirname "${BASH_SOURCE[0]}")"
+source "$here/../../sandbox/lib.sh"
+chaos_fault "$here/fault.yaml" redis-cart "$@"

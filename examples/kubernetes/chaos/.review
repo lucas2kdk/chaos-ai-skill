@@ -1,0 +1,4 @@
+binding: 844639987d1a422d
+hypothesis/cartservice-pod-kill: 2f8cfaadfd6e1b96
+hypothesis/productcatalog-network-delay: 05ca7ad4cf929147
+hypothesis/redis-cart-loss: f41d50efe694cdf9

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Fail unless a finding follows docs/finding-format.md. Sinks run this before publishing anything.
+# usage: lint-finding <finding.md>
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+f="${1:?usage: lint-finding <finding.md>}"
+[[ -f "$f" ]] || die "no such file: $f"
+find_chaos_dir
+fail=0
+bad() { echo "lint: $*" >&2; fail=1; }
+
+[[ "$(head -n1 "$f")" == "---" ]] || bad "the finding must start with frontmatter (title, severity, run)"
+[[ -n "$(fm_get "$f" title)" ]] || bad "frontmatter title is missing"
+sev="$(fm_get "$f" severity)"
+[[ "$sev" =~ ^sev-[0-3]$ ]] || bad "frontmatter severity must be sev-0, sev-1, sev-2 or sev-3, got '${sev}'"
+run="$(fm_get "$f" run)"
+if [[ -z "$run" ]]; then
+  bad "frontmatter run is missing"
+elif [[ ! -f "$CHAOS_DIR/runs/$run/record.json" ]]; then
+  bad "frontmatter run '$run' has no chaos/runs/$run/record.json"
+fi
+
+body="$(strip_fm "$f")"
+want=$'Hypothesis\nExpected\nObserved\nReproduction\nEvidence\nSuspected cause (unverified hypothesis)'
+got="$(grep -E '^## ' <<<"$body" | sed 's/^## //' || true)"
+[[ "$got" == "$want" ]] || bad "## headings must be exactly, in order: $(tr '\n' '|' <<<"$want"); got: $(tr '\n' '|' <<<"$got") (Provenance is added by the sink)"
+
+repro="$(sed -n '/^## Reproduction/,/^## Evidence/p' <<<"$body")"
+for sub in Fault Steps "Check command"; do
+  grep -q "^### $sub" <<<"$repro" || bad "Reproduction is missing a '### $sub' subsection"
+done
+grep -q 'chaos/runs/' <<<"$body" && bad "body points at a local chaos/runs/ path; a fixer may not have it, so put the evidence in the body"
+"$PLUGIN_ROOT/scripts/sanitize" --detect "$f" || bad "the finding contains something that looks like a credential or an email; sanitize it first"
+
+[[ $fail -eq 0 ]] && echo "lint: ok ($f)"
+exit $fail

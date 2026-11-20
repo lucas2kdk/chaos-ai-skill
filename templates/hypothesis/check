@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Probe the steady state. Print what was measured. Never change the target.
+# Exit 0 = steady state holds, non-zero = violated.
+set -uo pipefail
+echo "TODO: measure the steady state" >&2
+exit 1

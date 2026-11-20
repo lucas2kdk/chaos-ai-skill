@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Build the image and start the store and api containers on their own network, all labelled with a
+# fresh instance id that guard checks. The api restarts on failure, like it would in production.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+"$DOCKER" build -q -t "$IMAGE" "$APP" >/dev/null
+id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+labels=(--label chaos.sandbox=$PROJECT --label "chaos.instance=$id")
+
+"$(dirname "${BASH_SOURCE[0]}")/down" >/dev/null 2>&1 || true
+"$DOCKER" network create "${labels[@]}" "$NET" >/dev/null
+"$DOCKER" run -d --name "$STORE" --network "$NET" --network-alias store "${labels[@]}" \
+  --init "$IMAGE" python -u store.py >/dev/null
+"$DOCKER" run -d --name "$API" --network "$NET" "${labels[@]}" -p 127.0.0.1:18080:8080 \
+  --init --restart on-failure "$IMAGE" >/dev/null
+echo "$id" > "$INSTANCE_FILE"
+
+for _ in $(seq 1 30); do
+  [[ "$(get /items 2 | cut -d' ' -f1)" == 200 ]] && { echo "sandbox up (instance $id)"; exit 0; }
+  sleep 1
+done
+echo "sandbox did not become healthy in 30s" >&2
+exit 1

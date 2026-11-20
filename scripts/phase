@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# Drive one chaos run. Every action that touches the target goes through here, so the run state in
+# chaos/runs/.active is always true, and the guardrail hook can enforce what each phase may do.
+#
+# usage: phase start [--verify] <hypothesis-id>   begin a run (phase plan); prints the run id
+#        phase up                                 bring the sandbox up (sandbox targets, plan phase)
+#        phase guard                              run chaos/sandbox/guard; required before any fault
+#        phase confirm                            confirm an existing (non-sandbox) target for this run
+#        phase baseline                           run the check with no fault active (plan; triage)
+#        phase to <inject|observe|triage|report|cleanup>   move forward; phases never go back
+#        phase fault <apply|revert|status>        the selected hypothesis's fault (apply: inject, or once in triage)
+#        phase check                              wait, then run the hypothesis check (observe, triage)
+#        phase recover                            after revert, re-run the check until it holds (observe, triage)
+#        phase reset                              triage, sandbox only, once: down, up, guard, baseline
+#        phase evidence                           collect evidence into the run directory (observe, triage)
+#        phase note <text>                        add a note to the run record
+#        phase end <held|violated|not-reproducible> [finding-ref]   revert, tear down, record, finish
+#        phase abort [reason]                     same as end, with outcome aborted
+#        phase show                               print the active run state and the watchdog deadline
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+find_chaos_dir
+
+ACTIVE="$CHAOS_DIR/runs/.active"
+ORDER=(plan inject observe triage report cleanup)
+
+st() { jq -r --arg k "$1" '.[$k] | if . == null then empty else . end' "$ACTIVE"; }
+set_st() { jq "$@" "$ACTIVE" > "$ACTIVE.tmp" && mv "$ACTIVE.tmp" "$ACTIVE"; }
+need_run() { [[ -f "$ACTIVE" ]] || die "no active run; start one with: phase start <hypothesis-id>"; }
+rundir() { echo "$CHAOS_DIR/runs/$(st run)"; }
+hypdir() { echo "$CHAOS_DIR/hypotheses/$(st hypothesis)"; }
+# set_rec <jq args...>: update the run's record.json
+set_rec() {
+  local f
+  f="$(rundir)/record.json"
+  jq "$@" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+}
+# log_event <text> [json object merged into the event]
+log_event() {
+  local extra="${2:-}"
+  [[ -n "$extra" ]] || extra='{}'
+  set_rec --arg e "$1" --arg at "$(now)" --argjson x "$extra" '.phases += [{phase: $e, at: $at} + $x]'
+}
+index_of() { local i; for i in "${!ORDER[@]}"; do [[ "${ORDER[$i]}" == "$1" ]] && { echo "$i"; return; }; done; echo -1; }
+in_phase() {
+  local p cur
+  cur="$(st phase)"
+  for p in "$@"; do [[ "$cur" == "$p" ]] && return 0; done
+  die "not allowed in phase '$cur' (allowed in: $*)"
+}
+epoch() { date -u -d "$1" +%s; }
+# not_aborted: refuse to go on once an abort check stopped the experiment.
+not_aborted() {
+  local by
+  by="$(st aborted_by)"
+  [[ -z "$by" ]] || die "the experiment was stopped by the $by ($(st abort_output)); end the run with: phase abort"
+}
+
+run_guard() {
+  local out rc=0
+  out="$("$CHAOS_DIR/sandbox/guard" 2>&1)" || rc=$?
+  [[ -n "$out" ]] && echo "$out"
+  if [[ $rc -eq 0 ]]; then
+    set_st '.guard_passed = true'
+    log_event "guard passed" "$(jq -n --arg o "$(head -n1 <<<"$out")" '{output: $o}')"
+  else
+    set_st '.guard_passed = false'
+    log_event "guard failed" "$(jq -n --arg o "$(head -n1 <<<"$out")" '{output: $o}')"
+    die "guard failed: the live target does not match chaos/target.md; no fault will be applied"
+  fi
+}
+
+fault_status() { "$(hypdir)/fault" status 2>&1 | head -n1 || true; }
+fault_inactive() { [[ "$(fault_status)" == inactive ]]; }
+
+stop_watchdog() {
+  local pid
+  pid="$(st watchdog_pid)"
+  [[ -n "$pid" ]] && kill -- "-$pid" 2>/dev/null || true
+  set_st '.watchdog_pid = null'
+}
+
+revert() {
+  "$(hypdir)/fault" revert
+  stop_watchdog
+  set_st '.fault_active = false'
+  log_event "fault reverted" "$(jq -n --arg s "$(fault_status)" '{status_after: $s}')"
+}
+
+# run_check <label>: run the check under check_timeout; save output; log exit code and summary; return the exit code.
+# For control-group hypotheses, measure both groups at the same time and compare them against the tolerance.
+run_check() {
+  local label=$1 n out rc=0 summary extra='{}'
+  n=$(( $(find "$(rundir)" -maxdepth 1 -name 'check-*.out' | wc -l) + 1 ))
+  out="$(rundir)/check-$n.out"
+  if [[ "$(st control)" == true ]]; then
+    compare_groups "$out" || rc=$?
+    extra="$(cat "$out.json")"; rm -f "$out.json"
+  else
+    timeout "$(st check_timeout_s)" "$(hypdir)/check" > "$out" 2>&1 || rc=$?
+    [[ $rc -eq 124 ]] && echo "VIOLATED: check timed out after $(st check_timeout_s)s" >> "$out"
+  fi
+  echo "$rc" > "$(rundir)/check-$n.exit"
+  summary="$(grep -m1 'VIOLATED' "$out" || tail -n1 "$out")"
+  summary="${summary:0:200}"
+  log_event "$label $n exit $rc" "$(jq -n --argjson rc "$rc" --arg s "$summary" --argjson x "$extra" '{exit: $rc, summary: $s} + $x')"
+  cat "$out"
+  return "$rc"
+}
+
+# group_value <file>: the number on the last "value: <number>" line, or nothing.
+group_value() { sed -nE 's/^value:[[:space:]]*(-?[0-9]+(\.[0-9]+)?)[[:space:]]*$/\1/p' "$1" | tail -n1; }
+
+# compare_groups <out>: run `check control` and `check experiment` concurrently, write both outputs and a verdict
+# to <out> and {control, experiment, diff} to <out>.json; return 0 within tolerance, 1 otherwise.
+compare_groups() {
+  local out=$1 ct tol pc pe rcc=0 rce=0 cv ev d verdict
+  ct="$(st check_timeout_s)" tol="$(st tolerance)"
+  timeout "$ct" "$(hypdir)/check" control > "$out.control" 2>&1 & pc=$!
+  timeout "$ct" "$(hypdir)/check" experiment > "$out.experiment" 2>&1 & pe=$!
+  wait "$pc" || rcc=$?
+  wait "$pe" || rce=$?
+  cv="$(group_value "$out.control")" ev="$(group_value "$out.experiment")"
+  { echo "== control (exit $rcc)"; cat "$out.control"; echo "== experiment (exit $rce)"; cat "$out.experiment"; } > "$out"
+  rm -f "$out.control" "$out.experiment"
+  if [[ $rcc -ne 0 || -z "$cv" ]]; then
+    verdict="VIOLATED: could not measure control"
+  elif [[ $rce -ne 0 || -z "$ev" ]]; then
+    verdict="VIOLATED: could not measure experiment"
+  elif awk -v c="$cv" 'BEGIN { exit !(c == 0) }'; then
+    verdict="VIOLATED: could not compare: the control value is 0"
+  else
+    d="$(awk -v c="$cv" -v e="$ev" 'BEGIN { x = (e - c) / c * 100; if (x < 0) x = -x; printf "%.1f", x }')"
+    if awk -v d="$d" -v t="$tol" 'BEGIN { exit !(d <= t) }'; then
+      verdict="ok: experiment $ev vs control $cv differs by $d% (tolerance $tol%)"
+    else
+      verdict="VIOLATED: experiment $ev vs control $cv differs by $d% (tolerance $tol%)"
+    fi
+  fi
+  echo "$verdict" >> "$out"
+  jq -n --arg c "$cv" --arg e "$ev" --arg d "${d:-}" \
+    '{control: ($c | tonumber? // null), experiment: ($e | tonumber? // null), diff_percent: ($d | tonumber? // null)}' > "$out.json"
+  [[ "$verdict" == ok:* ]]
+}
+
+baseline() {
+  [[ "$(st fault_active)" == false ]] && fault_inactive || die "baseline needs the fault to be inactive"
+  local rc=0
+  run_check baseline || rc=$?
+  if [[ $rc -eq 0 ]]; then set_st '.baseline = "pass"'; set_rec '.baseline = "pass"'; else set_st '.baseline = "fail"'; set_rec '.baseline = "fail"'; fi
+  return "$rc"
+}
+
+finish() {
+  local outcome=$1 ref=$2 failed=$3 note=$4 ok=1
+  if [[ "$(st fault_active)" == true ]] || ! fault_inactive; then
+    revert || ok=0
+  fi
+  if ! fault_inactive; then
+    ok=0
+    note="${note:+$note; }fault status does not report inactive after revert: CHECK THE TARGET BY HAND"
+  fi
+  if [[ "$(st brought_up)" == true && "$(config_get keep_sandbox false)" != true ]]; then
+    if "$CHAOS_DIR/sandbox/down"; then log_event "sandbox down"; else note="${note:+$note; }sandbox down failed"; fi
+  fi
+  [[ $ok -eq 1 ]] || { outcome=aborted; [[ -n "$failed" ]] || failed=cleanup; }
+  local args=()
+  [[ -n "$failed" ]] && args+=(--failed-phase "$failed")
+  [[ -n "$note" ]] && args+=(--note "$note")
+  "$PLUGIN_ROOT/scripts/record" "${args[@]}" "$(st run)" "$(st hypothesis)" "$outcome" ${ref:+"$ref"}
+  rm -f "$ACTIVE"
+  if [[ $ok -eq 1 ]]; then
+    echo "cleanup confirmed: fault inactive"
+  else
+    echo "CLEANUP NOT CONFIRMED: the fault may still be active; check the target by hand"
+    exit 1
+  fi
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  start)
+    mode=run
+    case "${1:-}" in
+      --verify) mode=verify; shift ;;
+      --auto) mode=auto; shift ;;
+    esac
+    hyp="${1:?usage: phase start [--verify|--auto] <hypothesis-id>}"
+    [[ ! -f "$ACTIVE" ]] || die "run $(st run) is still active; finish it with: phase end ... or phase abort"
+    "$PLUGIN_ROOT/scripts/validate" binding >&2 || die "binding is not valid and reviewed"
+    "$PLUGIN_ROOT/scripts/validate" hypothesis "$hyp" >&2 || die "hypothesis $hyp is not valid and reviewed"
+    run="$(date -u +%Y%m%dT%H%M%SZ)"
+    while [[ -e "$CHAOS_DIR/runs/$run" ]]; do run="${run%Z*}Z-$RANDOM"; done
+    mkdir -p "$CHAOS_DIR/runs/$run"
+    md="$CHAOS_DIR/hypotheses/$hyp/hypothesis.md"
+    secs="$(to_seconds "$(fm_get "$md" duration)")"
+    wait_s="$(to_seconds "$(fm_get "$md" wait)" || echo 5)"; [[ -n "$(fm_get "$md" wait)" ]] || wait_s=5
+    ct_s=60; [[ -z "$(fm_get "$md" check_timeout)" ]] || ct_s="$(to_seconds "$(fm_get "$md" check_timeout)")"
+    rw_s=$((wait_s + ct_s)); [[ -z "$(fm_get "$md" recovers_within)" ]] || rw_s="$(to_seconds "$(fm_get "$md" recovers_within)")"
+    one_off=false; [[ "$(fm_get "$md" one_off)" == true ]] && one_off=true
+    ai_s=5; [[ -z "$(fm_get "$md" abort_interval)" ]] || ai_s="$(to_seconds "$(fm_get "$md" abort_interval)")"
+    control=false; [[ "$(fm_get "$md" control)" == true ]] && control=true
+    tol="$(fm_get "$md" tolerance)"; tol="${tol%\%}"; [[ -n "$tol" ]] || tol=0
+    commit=""; dirty=null
+    if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+      if [[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]]; then dirty=true; else dirty=false; fi
+    fi
+    jq -n --arg run "$run" --arg hyp "$hyp" --arg kind "$(fm_get "$CHAOS_DIR/target.md" kind)" \
+       --arg mode "$mode" --argjson secs "$secs" --argjson w "$wait_s" --argjson ct "$ct_s" --argjson rw "$rw_s" \
+       --argjson one "$one_off" --arg at "$(now)" --argjson ai "$ai_s" --argjson ctl "$control" --argjson tol "$tol" \
+      '{run: $run, hypothesis: $hyp, mode: $mode, target_kind: $kind, phase: "plan", duration_seconds: $secs,
+        wait_s: $w, check_timeout_s: $ct, recovers_within_s: $rw, one_off: $one,
+        abort_interval_s: $ai, control: $ctl, tolerance: $tol, aborted_by: null,
+        guard_passed: false, confirmed: false, baseline: null, fault_active: false, applies: 0,
+        reinjected: false, resets: 0, triage_ready: false, brought_up: false, watchdog_pid: null,
+        fault_applied_at: null, started_at: $at}' > "$ACTIVE"
+    jq -n --arg run "$run" --arg hyp "$hyp" --arg mode "$mode" --arg at "$(now)" \
+       --arg commit "$commit" --argjson dirty "$dirty" --arg bh "$(binding_hash)" --arg hh "$(hypothesis_hash "$hyp")" \
+       --arg fid "$(fm_get "$CHAOS_DIR/target.md" fidelity)" --argjson one "$one_off" \
+       --arg src "$(fm_get "$md" source)" --argjson ctl "$control" --argjson tol "$tol" \
+      '{run: $run, hypothesis: $hyp, mode: $mode, started_at: $at,
+        provenance: {commit: (if $commit == "" then null else $commit end), dirty: $dirty,
+                     binding_hash: $bh, hypothesis_hash: $hh, fidelity: (if $fid == "" then null else $fid end),
+                     one_off: $one, source: (if $src == "" then null else $src end),
+                     control: $ctl, tolerance_percent: (if $ctl then $tol else null end)},
+        baseline: null, recovered: null, recovery_seconds: null, reproduction: null, notes: [],
+        phases: [{phase: "plan", at: $at}]}' > "$CHAOS_DIR/runs/$run/record.json"
+    echo "$run"
+    ;;
+  up)
+    need_run; in_phase plan
+    [[ "$(st target_kind)" == sandbox ]] || die "target is not a sandbox; nothing to bring up"
+    "$CHAOS_DIR/sandbox/up"
+    set_st '.brought_up = true'
+    log_event "sandbox up"
+    ;;
+  guard)
+    need_run; run_guard; echo "guard passed"
+    ;;
+  confirm)
+    need_run; in_phase plan
+    [[ "$(st target_kind)" == existing ]] || die "only existing targets need confirmation"
+    set_st '.confirmed = true'
+    log_event "existing target confirmed by user"
+    echo "confirmed target '$(fm_get "$CHAOS_DIR/target.md" name)' for run $(st run)"
+    ;;
+  baseline)
+    need_run; in_phase plan triage
+    rc=0; baseline || rc=$?
+    if [[ "$(st phase)" == triage ]]; then
+      if [[ $rc -eq 0 ]]; then
+        set_st '.triage_ready = true'
+        echo "baseline holds: the repeat may run"
+      else
+        set_rec '.reproduction = "skipped"'
+        log_event "repeat skipped: target has not recovered"
+        echo "baseline violated: the target has not recovered, so the repeat is skipped (not independently reproduced)"
+      fi
+    elif [[ $rc -eq 0 ]]; then
+      echo "baseline holds"
+    else
+      echo "BASELINE VIOLATED: the target is unhealthy before any fault; abort this run"
+    fi
+    exit "$rc"
+    ;;
+  to)
+    need_run
+    next="${1:?usage: phase to <phase>}"
+    cur="$(st phase)"
+    ni="$(index_of "$next")"; ci="$(index_of "$cur")"
+    (( ni > 0 )) || die "unknown phase '$next' (${ORDER[*]:1})"
+    (( ni > ci )) || die "phases only move forward: '$cur' -> '$next' is not allowed"
+    if [[ "$next" == inject ]]; then
+      [[ "$(st guard_passed)" == true ]] || die "run phase guard first"
+      [[ "$(st target_kind)" == sandbox || "$(st confirmed)" == true ]] || die "existing target: run phase confirm first"
+      [[ "$(st baseline)" == pass ]] || die "run phase baseline first; inject needs a healthy baseline"
+    fi
+    set_st --arg p "$next" '.phase = $p'
+    log_event "$next"
+    echo "phase $next"
+    ;;
+  fault)
+    need_run
+    action="${1:?usage: phase fault <apply|revert|status>}"
+    case "$action" in
+      apply)
+        not_aborted
+        cur="$(st phase)"
+        if [[ "$cur" == inject ]]; then
+          [[ "$(st applies)" == 0 ]] || die "the fault was already applied in this run"
+        elif [[ "$cur" == triage ]]; then
+          [[ "$(st reinjected)" == false ]] || die "triage may re-apply the fault only once"
+          [[ "$(st triage_ready)" == true ]] || die "triage repeats from a fresh start: run phase reset (sandbox) or phase baseline (existing target) first"
+          set_st '.reinjected = true'
+          set_rec '.reproduction = "repeated"'
+        else
+          die "fault apply is not allowed in phase '$cur' (allowed in: inject, once in triage)"
+        fi
+        [[ "$(st fault_active)" == false ]] || die "the fault is already active"
+        # A fault left on the target (by an earlier run or by hand) would make apply a silent no-op.
+        fault_inactive || die "fault status does not report inactive before apply: something is already active on the target; run phase fault revert and check the target"
+        [[ "$(st target_kind)" == sandbox || "$(st confirmed)" == true ]] || die "existing target: run phase confirm first"
+        run_guard
+        set_st --arg at "$(now)" '.fault_active = true | .applies += 1 | .fault_applied_at = $at'
+        pid="$(setsid nohup "$PLUGIN_ROOT/scripts/watchdog" "$CHAOS_DIR" "$(st run)" "$(st duration_seconds)" \
+               >/dev/null 2>&1 & echo $!)"
+        set_st --argjson pid "$pid" '.watchdog_pid = $pid'
+        if ! "$(hypdir)/fault" apply; then
+          revert || true
+          die "fault apply failed; reverted"
+        fi
+        if [[ "$(st one_off)" == true ]]; then
+          log_event "fault applied" '{"status_after": "one-off; effect not asserted"}'
+          set_st '.fault_active = false'
+          echo "one-off fault applied (effect not asserted)"
+        else
+          s=""
+          for _ in $(seq 1 20); do s="$(fault_status)"; [[ "$s" == active ]] && break; sleep 0.5; done
+          log_event "fault applied" "$(jq -n --arg s "$s" '{status_after: $s}')"
+          if [[ "$s" != active ]]; then
+            revert || true
+            echo "FAULT DID NOT TAKE EFFECT: fault status reports '$s' after apply; reverted. Abort this run."
+            exit 3
+          fi
+          echo "fault active (confirmed)"
+        fi
+        ;;
+      revert) revert; echo "fault reverted (status: $(fault_status))" ;;
+      status) fault_status ;;
+      *) die "usage: phase fault <apply|revert|status>" 2 ;;
+    esac
+    ;;
+  check)
+    need_run; in_phase observe triage; not_aborted
+    if [[ "$(st fault_active)" == true || "$(st one_off)" == true ]] && [[ -n "$(st fault_applied_at)" ]]; then
+      left=$(( $(epoch "$(st fault_applied_at)") + $(st wait_s) - $(date -u +%s) ))
+      (( left > 0 )) && sleep "$left"
+    fi
+    rc=0; run_check check || rc=$?
+    exit "$rc"
+    ;;
+  recover)
+    need_run; in_phase observe triage; not_aborted
+    [[ "$(st fault_active)" == false ]] || die "revert the fault first: phase fault revert"
+    rw="$(st recovers_within_s)" start=$(date -u +%s) rc=1
+    # Recovery time counts to the start of the first passing check, not its end.
+    while :; do
+      attempt=$(( $(date -u +%s) - start ))
+      rc=0; run_check recover >/dev/null || rc=$?
+      el=$(( $(date -u +%s) - start ))
+      [[ $rc -eq 0 ]] && { el=$attempt; break; }
+      (( el >= rw )) && break
+      sleep 2
+    done
+    if [[ $rc -eq 0 ]]; then
+      set_rec --argjson s "$el" '.recovered = true | .recovery_seconds = $s'
+      log_event "recovered" "$(jq -n --argjson s "$el" '{seconds: $s}')"
+      echo "recovered after ${el}s"
+    else
+      set_rec --argjson s "$el" '.recovered = false | .recovery_seconds = null | .observed_without_recovery_seconds = $s'
+      log_event "not recovered" "$(jq -n --argjson s "$el" '{seconds: $s}')"
+      echo "NOT RECOVERED: steady state still violated ${el}s after revert"
+      exit 1
+    fi
+    ;;
+  reset)
+    need_run; in_phase triage
+    [[ "$(st target_kind)" == sandbox ]] || die "reset is for sandbox targets; for an existing target run phase baseline"
+    [[ "$(st resets)" == 0 ]] || die "the sandbox can be reset only once per run"
+    [[ "$(st fault_active)" == false ]] || die "revert the fault first: phase fault revert"
+    set_st '.resets = 1 | .guard_passed = false'
+    "$CHAOS_DIR/sandbox/down"; log_event "sandbox down (reset)"
+    "$CHAOS_DIR/sandbox/up"; set_st '.brought_up = true'; log_event "sandbox up (reset)"
+    run_guard
+    rc=0; baseline || rc=$?
+    [[ $rc -eq 0 ]] || die "baseline violated on a fresh sandbox; the target is unhealthy before any fault"
+    set_st '.triage_ready = true'
+    echo "sandbox reset: fresh instance, guard passed, baseline holds; the repeat may run"
+    ;;
+  evidence)
+    need_run; in_phase observe triage
+    since="$(st fault_applied_at)"
+    "$CHAOS_DIR/sandbox/evidence" "$(rundir)/evidence" "${since:-$(st started_at)}"
+    log_event "evidence collected"
+    echo "$(rundir)/evidence"
+    ;;
+  note)
+    need_run
+    text="${*:?usage: phase note <text>}"
+    set_rec --arg t "$text" '.notes += [$t]'
+    log_event "note: $text"
+    ;;
+  end)
+    need_run
+    outcome="${1:?usage: phase end <held|violated|not-reproducible> [finding-ref]}"
+    [[ "$outcome" != aborted ]] || die "use: phase abort [reason]"
+    finish "$outcome" "${2:-}" "" ""
+    ;;
+  abort)
+    need_run
+    reason="${*:-aborted}"
+    [[ -z "$(st aborted_by)" ]] || reason="stopped by the $(st aborted_by): $(st abort_output)${*:+; $*}"
+    finish aborted "" "$(st phase)" "$reason"
+    ;;
+  show)
+    if [[ ! -f "$ACTIVE" ]]; then echo "no active run"; exit 1; fi
+    deadline=null
+    if [[ "$(st fault_active)" == true && -n "$(st watchdog_pid)" ]]; then
+      deadline="\"$(date -u -d "@$(( $(epoch "$(st fault_applied_at)") + $(st duration_seconds) ))" +%FT%TZ)\""
+    fi
+    jq --argjson d "$deadline" '. + {watchdog_deadline: $d}' "$ACTIVE"
+    ;;
+  *) die "usage: phase start|up|guard|confirm|baseline|to|fault|check|recover|reset|evidence|note|end|abort|show (see the header of this script)" 2 ;;
+esac

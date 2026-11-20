@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Guard a run's fault independently of the Claude session: every abort_interval, run the target's and the
+# hypothesis's abort checks and stop the experiment if one fails; at duration expiry, revert the fault.
+# Started detached by `phase fault apply`; killed by `phase fault revert`.
+# usage: watchdog <chaos-dir> <run-id> <seconds>
+set -uo pipefail
+export CHAOS_DIR=$1
+run=$2 secs=$3
+active="$CHAOS_DIR/runs/.active"
+rec="$CHAOS_DIR/runs/$run/record.json"
+
+ours() { [[ -f "$active" && "$(jq -r .run "$active")" == "$run" ]]; }
+upd() { local f=$1; shift; jq "$@" "$f" > "$f.tmp.$$" && mv "$f.tmp.$$" "$f"; }
+event() { upd "$rec" --arg e "$1" --arg at "$(date -u +%FT%TZ)" '.phases += [{phase: $e, at: $at}]'; }
+
+ours || exit 0
+hyp="$(jq -r .hypothesis "$active")"
+interval="$(jq -r '.abort_interval_s // 5' "$active")"
+checks=()
+[[ -x "$CHAOS_DIR/sandbox/abort" ]] && checks+=("target:$CHAOS_DIR/sandbox/abort")
+[[ -x "$CHAOS_DIR/hypotheses/$hyp/abort" ]] && checks+=("hypothesis:$CHAOS_DIR/hypotheses/$hyp/abort")
+deadline=$(( $(date -u +%s) + secs ))
+
+while :; do
+  left=$(( deadline - $(date -u +%s) ))
+  (( left > 0 )) || break
+  sleep $(( left < interval ? left : interval ))
+  ours || exit 0
+  (( $(date -u +%s) < deadline )) || break
+  for c in "${checks[@]}"; do
+    who="${c%%:*}" exe="${c#*:}" rc=0
+    out="$(timeout "$interval" "$exe" 2>&1)" || rc=$?
+    [[ $rc -eq 0 ]] && continue
+    [[ $rc -eq 124 ]] && out="abort check timed out after ${interval}s"
+    "$CHAOS_DIR/hypotheses/$hyp/fault" revert >/dev/null 2>&1
+    first="$(head -n1 <<<"$out")"
+    upd "$active" --arg by "$who abort check" --arg o "$first" \
+      '.aborted_by = $by | .abort_output = $o | .fault_active = false | .watchdog_pid = null'
+    upd "$rec" --arg by "$who abort check" --arg o "$first" '.aborted_by = $by | .abort_output = $o'
+    event "experiment stopped by $who abort check: $first"
+    exit 0
+  done
+done
+
+ours || exit 0
+[[ "$(jq -r .fault_active "$active")" == true ]] || exit 0
+"$CHAOS_DIR/hypotheses/$hyp/fault" revert
+upd "$active" '.fault_active = false | .watchdog_pid = null'
+event "fault reverted by watchdog at duration expiry"

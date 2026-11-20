@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Print the id of the next hypothesis to test: the first valid, reviewed one (alphabetical) with no open finding.
+# usage: pick
+# Exit 1 with a reason on stderr if there is nothing to test.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+find_chaos_dir
+
+covered="$("$PLUGIN_ROOT/scripts/sink" list-open | cut -d' ' -f1)"
+valid=0
+for dir in "$CHAOS_DIR"/hypotheses/*/; do
+  [[ -d "$dir" ]] || continue
+  id="$(basename "$dir")"
+  if ! out="$("$PLUGIN_ROOT/scripts/validate" hypothesis "$id")"; then
+    why="$(grep -m1 '^FAIL' <<<"$out" || true)"
+    echo "pick: skipping $id: ${why#FAIL hypothesis $id: }" >&2
+    continue
+  fi
+  valid=$((valid + 1))
+  if ! grep -qx "$id" <<<"$covered"; then echo "$id"; exit 0; fi
+done
+if [[ $valid -eq 0 ]]; then
+  echo "pick: no valid, reviewed hypotheses in chaos/hypotheses/; write one with /chaos:hypothesize" >&2
+else
+  echo "pick: all $valid valid hypotheses already have an open finding" >&2
+fi
+exit 1

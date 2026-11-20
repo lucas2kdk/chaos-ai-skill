@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Create (or reuse) the kind cluster with Online Boutique, Chaos Mesh and Prometheus, then issue the
+# per-role kubeconfigs. Idempotent: a cluster that already exists is updated, not recreated.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+"$ROOT/cluster/up.sh"
+"$ROOT/cluster/rbac/apply.sh"

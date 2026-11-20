@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Run reviewed hypotheses unattended, for schedulers (cron, CI). No agent, no prompts: the same phase
+# steps as /chaos:run, minus triage and reporting. A violation is recorded as needing triage with /chaos:run.
+# usage: autorun --all | autorun <hypothesis-id>...
+# Exit 0: nothing regressed. 1: a regression, or a violation with no earlier result.
+# Exit 2: a run could not complete, a cleanup was not confirmed (stops the batch), or autorun could not start.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+find_chaos_dir
+P="$PLUGIN_ROOT/scripts/phase"
+RUNS="$CHAOS_DIR/runs"
+
+[[ $# -gt 0 ]] || die "usage: autorun --all | autorun <hypothesis-id>..." 2
+kind="$(fm_get "$CHAOS_DIR/target.md" kind)"
+[[ "$kind" == sandbox ]] || die "the target is kind '$kind': unattended runs are for sandbox targets only, because an existing target needs a person to confirm every run" 2
+mkdir -p "$RUNS"
+[[ ! -f "$RUNS/.active" ]] || die "run $(jq -r .run "$RUNS/.active") is active; not touching the target" 2
+mkdir "$RUNS/.autorun.lock" 2>/dev/null || die "another autorun holds $RUNS/.autorun.lock" 2
+trap 'rmdir "$RUNS/.autorun.lock" 2>/dev/null' EXIT
+"$PLUGIN_ROOT/scripts/validate" binding >/dev/null || die "the binding is not valid and reviewed; run validate" 2
+
+if [[ "$1" == --all ]]; then
+  ids=()
+  for d in "$CHAOS_DIR"/hypotheses/*/; do [[ -d "$d" ]] && ids+=("$(basename "$d")"); done
+else
+  ids=("$@")
+fi
+
+started="$(date -u +%Y%m%dT%H%M%SZ)"
+entries="$(mktemp)"; trap 'rmdir "$RUNS/.autorun.lock" 2>/dev/null; rm -f "$entries"' EXIT
+worst=0
+raise() { (( $1 > worst )) && worst=$1; return 0; }
+
+# previous_outcome <id>: held or violated from the newest earlier run or autorun of this hypothesis, else nothing.
+previous_outcome() {
+  local f
+  for f in $(ls -1 "$RUNS"/*/record.json 2>/dev/null | sort -r); do
+    jq -e -r --arg h "$1" 'select(.hypothesis == $h and (.mode // "run") != "verify"
+      and (.outcome == "held" or .outcome == "violated")) | .outcome' "$f" 2>/dev/null && return 0
+  done
+  return 0
+}
+
+entry() {  # entry <id> <run> <outcome> <previous> <change> <note> [recovered] [recovery-seconds]
+  jq -n --arg id "$1" --arg run "$2" --arg o "$3" --arg p "$4" --arg c "$5" --arg n "$6" \
+        --argjson r "${7:-null}" --argjson rs "${8:-null}" '
+    {hypothesis: $id, run: (if $run == "" then null else $run end), outcome: (if $o == "" then null else $o end),
+     previous: (if $p == "" then null else $p end), change: $c, note: (if $n == "" then null else $n end),
+     recovered: $r, recovery_seconds: $rs}' >> "$entries"
+}
+
+stop_batch=0
+for id in "${ids[@]}"; do
+  if [[ $stop_batch -eq 1 ]]; then entry "$id" "" "" "" skipped "batch stopped after an unconfirmed cleanup"; continue; fi
+  if ! out="$("$PLUGIN_ROOT/scripts/validate" hypothesis "$id")"; then
+    why="$(grep -m1 '^FAIL' <<<"$out" || true)"
+    entry "$id" "" "" "" skipped "${why#FAIL hypothesis $id: }"
+    echo "$id: skipped (${why#FAIL hypothesis $id: })"
+    continue
+  fi
+  prev="$(previous_outcome "$id")"
+  if ! run="$("$P" start --auto "$id" 2>/dev/null)"; then
+    entry "$id" "" "" "$prev" incomplete "phase start failed"; raise 2; continue
+  fi
+  log="$RUNS/$run/autorun.log"
+  step() { echo "\$ phase $*" >> "$log"; "$P" "$@" >> "$log" 2>&1; }
+  reason="" crc=1
+  { step up && step guard; } || reason="sandbox up or guard failed"
+  [[ -n "$reason" ]] || step baseline || reason="baseline violated"
+  [[ -n "$reason" ]] || step to inject || reason="could not move to inject"
+  if [[ -z "$reason" ]]; then
+    frc=0; step fault apply || frc=$?
+    [[ $frc -eq 0 ]] || { [[ $frc -eq 3 ]] && reason="fault did not take effect" || reason="fault apply failed"; }
+  fi
+  if [[ -z "$reason" ]]; then
+    step to observe
+    crc=0; step check || crc=$?
+    step evidence || true
+    if [[ -n "$(jq -r '.aborted_by // empty' "$RUNS/.active")" ]]; then
+      reason="stopped by the $(jq -r .aborted_by "$RUNS/.active")"
+    else
+      step fault revert || reason="fault revert failed"
+      [[ -n "$reason" ]] || step recover || true
+    fi
+  fi
+  if [[ -n "$reason" ]]; then
+    step abort "$reason" || { stop_batch=1; raise 2; }
+  else
+    step to cleanup
+    if [[ $crc -eq 0 ]]; then step end held || { stop_batch=1; raise 2; }
+    else step end violated || { stop_batch=1; raise 2; }; fi
+  fi
+  rec="$RUNS/$run/record.json"
+  outcome="$(jq -r '.outcome // "aborted"' "$rec")"
+  case "$outcome:$prev" in
+    aborted:*) change=incomplete; raise 2 ;;
+    held:violated) change=fixed ;;
+    violated:held) change=regression; raise 1 ;;
+    violated:) change=new; raise 1 ;;
+    held:) change=new ;;
+    *) change=unchanged ;;
+  esac
+  [[ $stop_batch -eq 1 ]] && { change=incomplete; reason="${reason:+$reason; }cleanup not confirmed: check the target by hand"; }
+  note="$reason"
+  [[ "$outcome" == violated ]] && note="needs triage: /chaos:run $id"
+  recovered="$(jq -c '.recovered' "$rec")" rsecs="$(jq -c '.recovery_seconds' "$rec")"
+  entry "$id" "$run" "$outcome" "$prev" "$change" "$note" "$recovered" "$rsecs"
+  printf '%s: %s (%s%s), recovered: %s, run %s%s\n' "$id" "$outcome" "$change" "${prev:+, was $prev}" "$( [[ "$recovered" == null ]] && echo "not measured" || echo "$recovered" )" "$run" "${note:+ - $note}"
+done
+
+summary="$RUNS/autorun-$started.json"
+jq -s --arg at "$started" --argjson exit "$worst" '{started_at: $at, exit: $exit, hypotheses: .}' "$entries" > "$summary"
+echo "summary: $summary"
+exit "$worst"

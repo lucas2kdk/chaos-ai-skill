@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Exit 0 only if the kind cluster exists and the injector's scoped kubeconfig points at that cluster's
+# API server: faults are applied with exactly those credentials, so this is what must be proven.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+fail() { echo "guard: $*" >&2; exit 1; }
+
+kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME" || fail "kind cluster $CLUSTER_NAME does not exist"
+[[ -f "$INJ" && -f "$OBS" ]] || fail "per-role kubeconfigs missing; run chaos/sandbox/up"
+want="$(kind get kubeconfig --name "$CLUSTER_NAME" | sed -n 's/^ *server: //p' | head -n1)"
+for kc in "$INJ" "$OBS"; do
+  [[ "$(kubectl --kubeconfig "$kc" config current-context)" == "$KUBE_CONTEXT" ]] || fail "$kc is not for context $KUBE_CONTEXT"
+  got="$(kubectl --kubeconfig "$kc" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+  [[ "$got" == "$want" ]] || fail "$kc points at $got, not the kind cluster at $want"
+done
+kubectl --kubeconfig "$OBS" get namespace "$TARGET_NS" >/dev/null 2>&1 \
+  || kubectl --kubeconfig "$OBS" -n "$TARGET_NS" get deploy frontend >/dev/null 2>&1 \
+  || fail "namespace $TARGET_NS is not reachable with the observer credentials"
+echo "guard: kind cluster $CLUSTER_NAME at $want"

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# GitHub report sink: findings are issues in the current `gh` repo, labelled
+# chaos-found, sev-<n> and hyp:<hypothesis-id>. Refs are issue URLs. Commands: see scripts/sink.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+command -v gh >/dev/null || die "the github sink needs the gh CLI"
+find_chaos_dir
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  list-open)
+    gh issue list --label chaos-found --state open --json url,labels --limit 500 \
+      | jq -r --arg want "${1:-}" '.[] | .url as $u
+          | .labels[].name | select(startswith("hyp:")) | ltrimstr("hyp:")
+          | select($want == "" or . == $want) | "\(.) \($u)"'
+    ;;
+  create)
+    [[ $# -eq 2 ]] || die "usage: sink create <hypothesis-id> <finding.md>" 2
+    id=$1 body=$2
+    "$PLUGIN_ROOT/scripts/lint-finding" "$body" >/dev/null || die "finding not published"
+    sev="$(fm_get "$body" severity)" title="$(fm_get "$body" title)"
+    open="$("$0" list-open "$id" | head -n1)"
+    [[ -z "$open" ]] || die "an open finding exists for $id; use: sink comment ${open#* } <body.md>" 3
+    gh label create chaos-found --color D93F0B --description "Found by a chaos experiment" --force >/dev/null
+    gh label create "$sev" --color B60205 --description "Chaos finding severity" --force >/dev/null
+    gh label create "hyp:$id" --color 5319E7 --description "Chaos hypothesis $id" --force >/dev/null
+    pub="$(mktemp)"; publish_body "$body" "$pub"
+    gh issue create --title "$title" --label chaos-found --label "$sev" --label "hyp:$id" --body-file "$pub"
+    rm -f "$pub"
+    ;;
+  comment)
+    [[ $# -eq 2 ]] || die "usage: sink comment <ref> <body.md>" 2
+    "$PLUGIN_ROOT/scripts/sanitize" --detect "$2" || die "comment not published"
+    pub="$(mktemp)"; publish_body "$2" "$pub"
+    gh issue comment "$1" --body-file "$pub" >/dev/null
+    rm -f "$pub"
+    echo "$1"
+    ;;
+  close)
+    [[ $# -eq 1 ]] || die "usage: sink close <ref>" 2
+    gh issue close "$1" --comment "Verified fixed: the check passes while the fault is active." >/dev/null
+    echo "$1"
+    ;;
+  *) die "usage: sink list-open|create|comment|close ..." 2 ;;
+esac

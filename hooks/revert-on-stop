@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Stop and SessionEnd hook: if Claude stops while a chaos fault is active, revert it and record
+# the run as aborted. Runs with no fault active are left alone.
+set -uo pipefail
+export LC_ALL=C
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+input="$(cat)"
+event="$(jq -r '.hook_event_name // "Stop"' <<<"$input")"
+d="$(jq -r '.cwd // empty' <<<"$input")"
+[[ -n "$d" ]] || d="$PWD"
+while [[ "$d" != / && -n "$d" ]]; do
+  [[ -f "$d/chaos/runs/.active" ]] && break
+  d="$(dirname "$d")"
+done
+active="$d/chaos/runs/.active"
+[[ -f "$active" ]] || exit 0
+[[ "$(jq -r .fault_active "$active")" == true ]] || exit 0
+
+run="$(jq -r .run "$active")"
+cd "$d" || exit 0
+if CHAOS_DIR="$d/chaos" "$PLUGIN_ROOT/scripts/phase" abort "$event with an active fault; reverted by hook" >/dev/null 2>&1; then
+  msg="chaos: Claude stopped while run $run had an active fault. The fault was reverted and the run recorded as aborted."
+else
+  msg="chaos: Claude stopped while run $run had an active fault and the automatic revert could not be confirmed. Check the target now."
+fi
+jq -n --arg m "$msg" '{systemMessage: $m}'

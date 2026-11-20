@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# usage: fault apply|revert|status. Kills the api process; the container's restart policy should bring it back.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../../sandbox/lib.sh"
+case "${1:-}" in
+  apply) "$DOCKER" exec "$API" pkill -f api.py ;;
+  revert) : ;;           # one-off event: nothing to undo
+  status) echo inactive ;;
+  *) echo "usage: fault apply|revert|status" >&2; exit 2 ;;
+esac

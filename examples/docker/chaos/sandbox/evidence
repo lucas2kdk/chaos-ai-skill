@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# usage: evidence <out-dir> <since>. Timestamped container logs and state since <since>. Read-only.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+out="${1:?usage: evidence <out-dir> <since>}" since="${2:?usage: evidence <out-dir> <since>}"
+mkdir -p "$out"
+for c in "$API" "$STORE"; do
+  "$DOCKER" logs --timestamps --since "$since" "$c" > "$out/${c#$PROJECT-}.log" 2>&1
+  "$DOCKER" inspect -f '{{.Name}} status={{.State.Status}} paused={{.State.Paused}} restarts={{.RestartCount}} started={{.State.StartedAt}}' \
+    "$c" >> "$out/containers.txt" 2>&1
+done
